@@ -1,0 +1,263 @@
+/*
+============================================================
+MINISUMO – VERSIÓN ANTI-CICLADO Y RASTREO DINÁMICO
+============================================================
+*/
+
+#include <Adafruit_NeoPixel.h>
+
+// ───── PINES GENERALES Y MOTORES ──────────────────
+#define PUSH 12
+#define LED 5
+
+#define MOTOR_RIGHT_PWM 17
+#define MOTOR_RIGHT_DIR 16
+#define MOTOR_LEFT_DIR 18
+#define MOTOR_LEFT_PWM 4
+
+// ───── PINES SENSORES DE LÍNEA (4) ────────────────
+#define IR_FRONT_RIGHT 35
+#define IR_FRONT_LEFT 39
+#define IR_BACK_RIGHT 36
+#define IR_BACK_LEFT 27
+
+// ───── PINES SENSORES DE ENEMIGO (5) ──────────────
+#define SENSOR_IZQ_EXTREMA 26 
+#define SENSOR_IZQ_CENTRO  25 
+#define SENSOR_CENTRO      33 
+#define SENSOR_DER_CENTRO  32 
+#define SENSOR_DER_EXTREMA 23 
+
+// ───── CONFIGURACIÓN PWM Y UMBRALES ───────────────
+#define FREQUENCY_PWM 4000
+#define RESOLUTION_PWM 10 
+
+#define UMBRAL_LINEA 3400    
+#define UMBRAL_ENEMIGO 300   
+
+// ───── VELOCIDADES DE PATRULLAJE LIBRE ─────────
+#define VEL_MAXIMA 1023      
+#define VEL_CURVA_RAPIDA 500 
+#define VEL_CURVA_LENTA 150  
+
+// ───── NUEVOS TIEMPOS DE EVASIÓN PARA ROMPER CICLOS ─────────
+#define TIEMPO_REVERSA_EVASION 300 
+#define GIRO_MIN 150  // Tiempo mínimo de giro
+#define GIRO_MAX 400  // Tiempo máximo de giro (aleatorio)
+
+Adafruit_NeoPixel pixels(1, LED, NEO_GRB + NEO_KHZ800);
+
+// ───── VARIABLES GLOBALES DE ESTADO ───────────────
+int ultimaDireccion = 0; 
+uint32_t colorActual = 0; 
+
+int velocidadActualIzquierda = 9999; 
+int velocidadActualDerecha = 9999;
+
+// ───── SETUP ───────────────────
+void setup() {
+  Serial.begin(115200);
+  
+  // Generar semilla aleatoria leyendo un pin al aire para asegurar patrones únicos
+  randomSeed(analogRead(34)); 
+
+  ledcAttach(MOTOR_RIGHT_PWM, FREQUENCY_PWM, RESOLUTION_PWM);
+  ledcAttach(MOTOR_LEFT_PWM, FREQUENCY_PWM, RESOLUTION_PWM);
+
+  pinMode(MOTOR_RIGHT_DIR, OUTPUT);
+  pinMode(MOTOR_LEFT_DIR, OUTPUT);
+  pinMode(PUSH, INPUT_PULLUP);
+
+  pixels.begin();
+  setLED(0, 150, 0); 
+
+  while(digitalRead(PUSH));
+  
+  for(int i = 0; i < 5; i++){
+    setLED(150, 150, 0); delay(500);
+    setLED(0, 0, 0); delay(500);
+  }
+}
+
+// ───── LOOP PRINCIPAL ────────────────────
+void loop(){
+  // Si no está evadiendo la línea, busca/ataca al enemigo
+  if(!controlLinea()){
+    estrategiaCombate();
+  }
+}
+
+// ───── LÓGICA DE COMBATE ─────────
+void estrategiaCombate(){
+  bool eIzqExt = analogRead(SENSOR_IZQ_EXTREMA) > UMBRAL_ENEMIGO; 
+  bool eIzqCen = analogRead(SENSOR_IZQ_CENTRO) > UMBRAL_ENEMIGO; 
+  bool eCentro = analogRead(SENSOR_CENTRO) > UMBRAL_ENEMIGO; 
+  bool eDerCen = analogRead(SENSOR_DER_CENTRO) > UMBRAL_ENEMIGO; 
+  bool eDerExt = analogRead(SENSOR_DER_EXTREMA) > UMBRAL_ENEMIGO; 
+
+  if(eCentro){
+    setLED(0, 0, 255); 
+    setMotors(VEL_MAXIMA, VEL_MAXIMA); 
+  }
+  else if(eIzqCen){
+    ultimaDireccion = 0; 
+    setLED(0, 150, 255); 
+    setMotors(VEL_CURVA_RAPIDA, VEL_MAXIMA); 
+  }
+  else if(eDerCen){
+    ultimaDireccion = 1; 
+    setLED(0, 150, 255); 
+    setMotors(VEL_MAXIMA, VEL_CURVA_RAPIDA); 
+  }
+  else if(eIzqExt){
+    ultimaDireccion = 0; 
+    setLED(100, 0, 255); 
+    setMotors(VEL_CURVA_LENTA, VEL_MAXIMA);
+  }
+  else if(eDerExt){
+    ultimaDireccion = 1; 
+    setLED(100, 0, 255); 
+    setMotors(VEL_MAXIMA, VEL_CURVA_LENTA);
+  }
+  else{
+    // MODO PATRULLAJE (Vagabundeo agresivo por la pista)
+    if (ultimaDireccion == 0) {
+      setLED(255, 0, 100); 
+      setMotors(VEL_CURVA_LENTA, VEL_MAXIMA);
+    } else {
+      setLED(255, 0, 100); 
+      setMotors(VEL_MAXIMA, VEL_CURVA_LENTA);
+    }
+  }
+}
+
+// ───── LECTURA ULTRA RÁPIDA DE SENSOR DE LÍNEA ─────────
+int leerSensor(int pin){
+  int suma = analogRead(pin) + analogRead(pin) + analogRead(pin);
+  return suma / 3;
+}
+
+// ───── CONTROL DE LÍNEA (EVASIÓN INTELIGENTE ANTI-CICLOS) ─────────
+bool controlLinea(){
+  int valFR = leerSensor(IR_FRONT_RIGHT);
+  int valFL = leerSensor(IR_FRONT_LEFT);
+  int valBR = leerSensor(IR_BACK_RIGHT);
+  int valBL = leerSensor(IR_BACK_LEFT);
+
+  bool lineaFR = valFR < UMBRAL_LINEA;
+  bool lineaFL = valFL < UMBRAL_LINEA;
+  bool lineaBR = valBR < UMBRAL_LINEA;
+  bool lineaBL = valBL < UMBRAL_LINEA;
+
+  if(lineaFR || lineaFL){ 
+    setLED(255,0,0); 
+
+    // Frenado rápido
+    setMotors(0, 0);
+    delay(15); 
+
+    // Reversa para salir del borde
+    setMotors(-1023, -1023); 
+    delay(TIEMPO_REVERSA_EVASION);
+
+    // Cálculo de tiempo aleatorio para el giro
+    int tiempoGiro = random(GIRO_MIN, GIRO_MAX);
+
+    // Escape direccional: Girar hacia el lado contrario de donde se detectó la línea
+    if (lineaFR && !lineaFL) {
+      setMotors(-1023, 1023); // Tocó derecha -> gira izquierda
+      ultimaDireccion = 0;    // Prepara el patrullaje para ese lado
+    } 
+    else if (lineaFL && !lineaFR) {
+      setMotors(1023, -1023); // Tocó izquierda -> gira derecha
+      ultimaDireccion = 1;
+    } 
+    else {
+      // Si tocó los dos al mismo tiempo, decide al azar
+      if (random(0, 2) == 0) {
+        setMotors(-1023, 1023);
+        ultimaDireccion = 0;
+      } else {
+        setMotors(1023, -1023);
+        ultimaDireccion = 1;
+      }
+    }
+    
+    delay(tiempoGiro); 
+    return true; 
+  }
+  else if(lineaBR || lineaBL){ 
+    setLED(255,120,0); 
+
+    setMotors(0, 0);
+    delay(15); 
+
+    setMotors(1023, 1023); 
+    delay(TIEMPO_REVERSA_EVASION);
+
+    int tiempoGiro = random(GIRO_MIN, GIRO_MAX);
+
+    // Lógica similar para los sensores traseros
+    if (lineaBR && !lineaBL) {
+      setMotors(1023, -1023); 
+      ultimaDireccion = 1;
+    } 
+    else if (lineaBL && !lineaBR) {
+      setMotors(-1023, 1023); 
+      ultimaDireccion = 0;
+    } 
+    else {
+      if (random(0, 2) == 0) {
+        setMotors(-1023, 1023);
+        ultimaDireccion = 0;
+      } else {
+        setMotors(1023, -1023);
+        ultimaDireccion = 1;
+      }
+    }
+    
+    delay(tiempoGiro);
+    return true; 
+  }
+  
+  return false; 
+}
+
+// ───── CONTROL MOTORES ─────────
+void setMotors(int vL, int vR){
+  if (vR != velocidadActualDerecha) {
+    setMotor(MOTOR_RIGHT_DIR, MOTOR_RIGHT_PWM, -vR);
+    velocidadActualDerecha = vR; 
+  }
+  
+  if (vL != velocidadActualIzquierda) {
+    setMotor(MOTOR_LEFT_DIR, MOTOR_LEFT_PWM, -vL);
+    velocidadActualIzquierda = vL; 
+  }
+}
+
+void setMotor(int dir, int pwm, int vel){
+  vel = constrain(vel, -1023, 1023);
+
+  if(vel > 0){
+    ledcWrite(pwm, vel);
+    digitalWrite(dir, 1);
+  }
+  else if(vel < 0){
+    ledcWrite(pwm, -vel);
+    digitalWrite(dir, 0);
+  }
+  else{
+    ledcWrite(pwm, 0);
+  }
+}
+
+// ───── LED OPTIMIZADO ─────────
+void setLED(uint8_t r, uint8_t g, uint8_t b){
+  uint32_t nuevoColor = pixels.Color(r, g, b);
+  if(colorActual != nuevoColor){
+    pixels.setPixelColor(0, nuevoColor);
+    pixels.show();
+    colorActual = nuevoColor;
+  }
+}
