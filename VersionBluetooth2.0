@@ -1,0 +1,277 @@
+/*
+============================================================
+MINISUMO – BLUETOOTH COMPLETO (ARRANQUE Y PARADA DE EMERGENCIA)
+============================================================
+*/
+
+#include <Adafruit_NeoPixel.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error El Bluetooth no está habilitado en este ESP32.
+#endif
+
+BluetoothSerial SerialBT; 
+
+// --- CONFIGURACIÓN DE PINES ---
+#define PUSH 12
+#define START_REMOTE 19  // PIN DEL ARRANCADOR REMOTO
+#define LED  5
+#define MOTOR_RIGHT_PWM 17
+#define MOTOR_RIGHT_DIR 16
+#define MOTOR_LEFT_DIR  18
+#define MOTOR_LEFT_PWM   4
+
+// --- SENSORES ---
+#define IR_FRONT_RIGHT 35
+#define IR_FRONT_LEFT  39
+#define IR_BACK_RIGHT  36
+#define IR_BACK_LEFT   27
+
+#define SENSOR_IZQ_EXTREMA 26
+#define SENSOR_IZQ_CENTRO  25
+#define SENSOR_CENTRO      33
+#define SENSOR_DER_CENTRO  32
+#define SENSOR_DER_EXTREMA 23
+
+// --- PARÁMETROS DE CONTROL ---
+#define UMBRAL_LINEA    3400
+#define UMBRAL_ENEMIGO   150 
+
+#define FREQUENCY_PWM   4000
+#define RESOLUTION_PWM    10
+
+// --- ESCALERA DE VELOCIDADES ---
+#define VEL_ATAQUE        1023 
+#define VEL_BUSQUEDA       650  
+#define VEL_ARRANQUE_INICIO 400 
+#define VEL_GIRO_BUSQUEDA  500  
+
+#define TIEMPO_REVERSA_EVASION 200 
+#define TIEMPO_GIRO_EVASION    180
+
+enum FaseBusqueda { FASE_AVANCE, FASE_GIRO, FASE_ARCO };
+Adafruit_NeoPixel pixels(1, LED, NEO_GRB + NEO_KHZ800);
+
+// --- VARIABLES DE ESTADO ---
+bool inicioFinalizado = false;
+bool robotActivo     = false; 
+int  ultimaDireccion  = 0;
+FaseBusqueda faseBusqueda = FASE_AVANCE;
+unsigned long tiempoInicioFase = 0;
+int velocidadActualIzq = 9999;
+int velocidadActualDer = 9999;
+uint32_t colorActual = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // INICIAR BLUETOOTH
+  SerialBT.begin("MiniSumo_ESP32"); 
+  Serial.println("Bluetooth listo. Esperando comando...");
+
+  // Habilitar pines
+  pinMode(SENSOR_IZQ_EXTREMA, INPUT);
+  pinMode(SENSOR_IZQ_CENTRO,  INPUT);
+  pinMode(SENSOR_CENTRO,      INPUT);
+  pinMode(SENSOR_DER_CENTRO,  INPUT);
+  pinMode(SENSOR_DER_EXTREMA, INPUT);
+
+  pinMode(IR_FRONT_RIGHT, INPUT);
+  pinMode(IR_FRONT_LEFT,  INPUT);
+  pinMode(IR_BACK_RIGHT,  INPUT);
+  pinMode(IR_BACK_LEFT,   INPUT);
+
+  // Motores
+  ledcAttach(MOTOR_RIGHT_PWM, FREQUENCY_PWM, RESOLUTION_PWM);
+  ledcAttach(MOTOR_LEFT_PWM,  FREQUENCY_PWM, RESOLUTION_PWM);
+  pinMode(MOTOR_RIGHT_DIR, OUTPUT);
+  pinMode(MOTOR_LEFT_DIR,  OUTPUT);
+  
+  // Entradas
+  pinMode(PUSH, INPUT_PULLUP);
+  pinMode(START_REMOTE, INPUT); 
+  
+  pixels.begin();
+  
+  // FASE DE ESPERA
+  setLED(0, 150, 0); // Verde: Acomodando robot
+  
+  bool arranqueBluetooth = false;
+  
+  // Espera Triple: Botón físico, Arrancador, o Bluetooth '1'
+  while(digitalRead(PUSH) == HIGH && digitalRead(START_REMOTE) == LOW && !arranqueBluetooth) {
+    if (SerialBT.available()) {
+      char comando = SerialBT.read();
+      if (comando == '1' || comando == 's' || comando == 'S') {
+        arranqueBluetooth = true;
+      }
+    }
+    delay(10); 
+  }
+  
+  // ARRANQUE INSTANTÁNEO
+  robotActivo = true;
+  tiempoInicioFase = millis();
+}
+
+void loop() {
+  // --- 🔥 NUEVO: PARADA DE EMERGENCIA (KILL SWITCH) ---
+  if (SerialBT.available()) {
+    char comando = SerialBT.read();
+    if (comando == '0' || comando == 'x' || comando == 'X') {
+      setMotors(0, 0); // Apagar motores al instante
+      setLED(255, 0, 0); // LED Rojo indicando "Detenido por usuario"
+      
+      // Congelar el robot en un bucle infinito hasta recibir orden de reanudar
+      while(true) {
+        if (SerialBT.available()) {
+          char reinicio = SerialBT.read();
+          if (reinicio == '1' || reinicio == 's' || reinicio == 'S') {
+            // Reiniciar pelea
+            inicioFinalizado = false;
+            tiempoInicioFase = millis();
+            break; // Rompe el congelamiento y vuelve a pelear
+          }
+        }
+        delay(10);
+      }
+    }
+  }
+
+  // 1. PRIORIDAD: LÍNEA
+  if(controlLinea()){
+    inicioFinalizado = true; 
+    return; 
+  }
+
+  // 2. LÓGICA DE MOVIMIENTO
+  if(!inicioFinalizado){
+    arranqueInicial();
+  } else {
+    estrategiaCombate();
+  }
+}
+
+void arranqueInicial(){
+  if(analogRead(SENSOR_IZQ_CENTRO) > UMBRAL_ENEMIGO || 
+     analogRead(SENSOR_CENTRO)     > UMBRAL_ENEMIGO || 
+     analogRead(SENSOR_DER_CENTRO) > UMBRAL_ENEMIGO){
+    inicioFinalizado = true; 
+    return;
+  }
+  setLED(200, 200, 200); 
+  setMotors(VEL_ARRANQUE_INICIO, VEL_ARRANQUE_INICIO);
+}
+
+void estrategiaCombate(){
+  bool eIzqExt = analogRead(SENSOR_IZQ_EXTREMA) > UMBRAL_ENEMIGO;
+  bool eIzqCen = analogRead(SENSOR_IZQ_CENTRO)  > UMBRAL_ENEMIGO;
+  bool eCentro = analogRead(SENSOR_CENTRO)      > UMBRAL_ENEMIGO;
+  bool eDerCen = analogRead(SENSOR_DER_CENTRO)  > UMBRAL_ENEMIGO;
+  bool eDerExt = analogRead(SENSOR_DER_EXTREMA) > UMBRAL_ENEMIGO;
+
+  if(eIzqExt || eIzqCen || eCentro || eDerCen || eDerExt){
+    faseBusqueda     = FASE_AVANCE;
+    tiempoInicioFase = millis();
+  }
+
+  if(eCentro){
+    setLED(0, 0, 255); 
+    setMotors(VEL_ATAQUE, VEL_ATAQUE); 
+  }
+  else if(eIzqCen){
+    ultimaDireccion = 0;
+    setLED(0, 100, 200);
+    setMotors(VEL_BUSQUEDA / 2, VEL_ATAQUE); 
+  }
+  else if(eDerCen){
+    ultimaDireccion = 1;
+    setLED(0, 100, 200);
+    setMotors(VEL_ATAQUE, VEL_BUSQUEDA / 2);
+  }
+  else if(eIzqExt){
+    ultimaDireccion = 0;
+    setLED(100, 0, 200);
+    setMotors(-VEL_GIRO_BUSQUEDA, VEL_ATAQUE); 
+  }
+  else if(eDerExt){
+    ultimaDireccion = 1;
+    setLED(100, 0, 200);
+    setMotors(VEL_ATAQUE, -VEL_GIRO_BUSQUEDA);
+  }
+  else{
+    modoBusqueda();
+  }
+}
+
+void modoBusqueda(){
+  unsigned long ahora        = millis();
+  unsigned long transcurrido = ahora - tiempoInicioFase;
+
+  switch(faseBusqueda){
+    case FASE_AVANCE:
+      setLED(150, 70, 0);
+      setMotors(VEL_BUSQUEDA, VEL_BUSQUEDA); 
+      if(transcurrido >= 400){ faseBusqueda = FASE_GIRO; tiempoInicioFase = ahora; }
+      break;
+
+    case FASE_GIRO:
+      setLED(200, 50, 0);
+      if(ultimaDireccion == 0) setMotors(-VEL_GIRO_BUSQUEDA, VEL_GIRO_BUSQUEDA);
+      else                     setMotors(VEL_GIRO_BUSQUEDA, -VEL_GIRO_BUSQUEDA);
+      if(transcurrido >= 250){ faseBusqueda = FASE_ARCO; tiempoInicioFase = ahora; }
+      break;
+
+    case FASE_ARCO:
+      setLED(100, 30, 0);
+      if(ultimaDireccion == 0) setMotors(300, VEL_BUSQUEDA);
+      else                     setMotors(VEL_BUSQUEDA, 300);
+      if(transcurrido >= 500){ faseBusqueda = FASE_AVANCE; tiempoInicioFase = ahora; }
+      break;
+  }
+}
+
+bool controlLinea(){
+  bool lineaFR = analogRead(IR_FRONT_RIGHT) < UMBRAL_LINEA;
+  bool lineaFL = analogRead(IR_FRONT_LEFT)  < UMBRAL_LINEA;
+  bool lineaBR = analogRead(IR_BACK_RIGHT)  < UMBRAL_LINEA;
+  bool lineaBL = analogRead(IR_BACK_LEFT)   < UMBRAL_LINEA;
+
+  if(lineaFR || lineaFL){
+    setMotors(0, 0); delay(10);
+    setMotors(-VEL_ATAQUE, -VEL_ATAQUE);
+    setLED(255, 0, 0); 
+    delay(TIEMPO_REVERSA_EVASION);
+    if(lineaFR && !lineaFL)      setMotors(-VEL_BUSQUEDA, VEL_BUSQUEDA);
+    else if(lineaFL && !lineaFR) setMotors(VEL_BUSQUEDA, -VEL_BUSQUEDA);
+    else                         (ultimaDireccion == 0) ? setMotors(-VEL_BUSQUEDA, VEL_BUSQUEDA) : setMotors(VEL_BUSQUEDA, -VEL_BUSQUEDA);
+    delay(TIEMPO_GIRO_EVASION);
+    faseBusqueda = FASE_AVANCE;
+    tiempoInicioFase = millis();
+    return true;
+  }
+  if(lineaBR || lineaBL){
+    setMotors(VEL_ATAQUE, VEL_ATAQUE);
+    delay(150);
+    return true;
+  }
+  return false;
+}
+
+void setMotors(int vL, int vR){
+  if(vR != velocidadActualDer){ setMotor(MOTOR_RIGHT_DIR, MOTOR_RIGHT_PWM, -vR); velocidadActualDer = vR; }
+  if(vL != velocidadActualIzq){ setMotor(MOTOR_LEFT_DIR, MOTOR_LEFT_PWM, -vL); velocidadActualIzq = vL; }
+}
+
+void setMotor(int dir, int pwm, int vel){
+  vel = constrain(vel, -1023, 1023);
+  if(vel > 0){ ledcWrite(pwm, vel); digitalWrite(dir, 1); }
+  else if(vel < 0){ ledcWrite(pwm, -vel); digitalWrite(dir, 0); }
+  else { ledcWrite(pwm, 0); }
+}
+
+void setLED(uint8_t r, uint8_t g, uint8_t b){
+  uint32_t nuevoColor = pixels.Color(r, g, b);
+  if(colorActual != nuevoColor){ pixels.setPixelColor(0, nuevoColor); pixels.show(); colorActual = nuevoColor; }
+}
